@@ -11,8 +11,11 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
+    cors: {
+      origin: process.env.FRONTEND_URL,
+      methods: ['GET', 'POST'],
+      credentials: true
+    }
   }
 });
 
@@ -49,6 +52,10 @@ async function createWorker() {
     process.exit(1);
   });
 }
+
+app.get('/', (req, res) => {
+  res.send('RTC Server Running');
+});
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -114,7 +121,7 @@ io.on('connection', (socket) => {
 
       // Dynamically bind to the exact interface IP the client is using to connect
       let localIp = '127.0.0.1';
-      
+
       if (hostname === '192.168.56.1') {
         localIp = '192.168.56.1';
       } else if (hostname === '10.102.85.88') {
@@ -126,8 +133,8 @@ io.on('connection', (socket) => {
       const transport = await router.createWebRtcTransport({
         listenIps: [
           {
-            ip: localIp,
-            announcedIp: localIp
+            ip: '0.0.0.0',
+            announcedIp: process.env.ANNOUNCED_IP
           }
         ],
         enableUdp: true,
