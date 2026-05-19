@@ -28,7 +28,7 @@ export default function Home() {
           Interactive, high-quality, real-time video classes with WebRTC and Next.js.
         </p>
       </div>
-      
+
       <div className="z-10 bg-gray-800/60 backdrop-blur-xl p-8 rounded-3xl shadow-2xl w-full max-w-md border border-gray-700/50">
         <form onSubmit={handleJoin} className="space-y-6">
           <div>
@@ -45,7 +45,7 @@ export default function Home() {
               required
             />
           </div>
-          
+
           <button
             type="submit"
             className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-semibold rounded-xl px-4 py-3 shadow-lg shadow-blue-500/30 transform transition-all active:scale-95 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900"
