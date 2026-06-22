@@ -1,10 +1,21 @@
 import React from 'react';
 import { Mic, MicOff, Video, VideoOff, MessageSquare, Settings, PhoneOff } from 'lucide-react';
 import { Tooltip } from './Tooltip';
+import { ScreenShareControls } from './ScreenShareControls';
 
-export const ClassroomFooter = ({ isMuted, isVideoOff, toggleMute, toggleVideo, leaveRoom, onToggleSettings }: any) => (
+export const ClassroomFooter = ({
+  isMuted,
+  isVideoOff,
+  toggleMute,
+  toggleVideo,
+  leaveRoom,
+  onToggleSettings,
+  isSharingScreen,
+  toggleScreenShare,
+  isScreenShareDisabled
+}: any) => (
   <footer className="pb-4 pt-2 px-4 z-10 relative">
-    <div className="max-w-sm mx-auto bg-[#0d1411]/90 backdrop-blur-xl border border-green-800/30 rounded-full px-4 py-2.5 flex items-center justify-between shadow-2xl shadow-black/50">
+    <div className="max-w-md mx-auto bg-[#0d1411]/90 backdrop-blur-xl border border-green-800/30 rounded-full px-4 py-2.5 flex items-center justify-between shadow-2xl shadow-black/50">
       
       <Tooltip text={isMuted ? 'Unmute' : 'Mute'}>
         <button onClick={toggleMute} className={`p-3 rounded-full transition-all duration-300 flex items-center justify-center ${isMuted ? 'bg-red-500/20 text-red-500 hover:bg-red-500/30 border border-red-500/30' : 'bg-green-900/60 hover:bg-green-800 text-green-100 border border-transparent'}`}>
@@ -17,6 +28,12 @@ export const ClassroomFooter = ({ isMuted, isVideoOff, toggleMute, toggleVideo, 
           {isVideoOff ? <VideoOff size={18} /> : <Video size={18} />}
         </button>
       </Tooltip>
+
+      <ScreenShareControls
+        isSharing={isSharingScreen}
+        onToggleShare={toggleScreenShare}
+        disabled={isScreenShareDisabled}
+      />
  
       <Tooltip text="Chat" className="hidden sm:flex">
         <button className="p-3 rounded-full bg-green-900/60 hover:bg-green-800 text-green-100 transition-all duration-300">

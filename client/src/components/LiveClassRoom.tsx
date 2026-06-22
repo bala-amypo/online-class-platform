@@ -6,20 +6,24 @@ import { useRouter } from 'next/navigation';
 import { useSpeakingDetection } from '../hooks/useSpeakingDetection';
 import { ClassroomHeader } from './ClassroomHeader';
 import { ClassroomFooter } from './ClassroomFooter';
-import { LocalVideoComponent } from './LocalVideoComponent';
-import { VideoComponent } from './VideoComponent';
+import { VideoGrid } from './VideoGrid';
+import { ScreenSharePresenter } from './ScreenSharePresenter';
 import { AudioParticipant } from './AudioParticipant';
-import { Users, Mic, MicOff, Camera, CameraOff, ChevronLeft, ChevronRight, Settings } from 'lucide-react';
+import { DeviceSetup } from './DeviceSetup';
+import { Users, Mic, MicOff, Camera, CameraOff, ChevronLeft, Settings, AlertTriangle } from 'lucide-react';
 
-export default function LiveClassRoom({ roomId }: { roomId: string }) {
+
+export default function LiveClassRoom({ roomId, initialRole = 'student' }: { roomId: string, initialRole?: string }) {
   const router = useRouter();
   const [stream, setStream] = useState<MediaStream | null>(null);
 
   // peers will store MediaStreams constructed from Mediasoup Consumers
   const [peers, setPeers] = useState<{ [id: string]: MediaStream }>({});
   const [peerMediaStates, setPeerMediaStates] = useState<{ [id: string]: { video: boolean, audio: boolean } }>({});
+  const [peerRoles, setPeerRoles] = useState<{ [id: string]: string }>({});
   const [participants, setParticipants] = useState<Set<string>>(new Set());
   const [localSocketId, setLocalSocketId] = useState<string | null>(null);
+  const localSocketIdRef = useRef<string | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<{ send: string, recv: string }>({ send: 'new', recv: 'new' });
   const [isMounted, setIsMounted] = useState(false);
@@ -31,36 +35,80 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
   const [toasts, setToasts] = useState<{ id: string, message: string, type: 'join' | 'leave' }[]>([]);
   const [isJoining, setIsJoining] = useState(true);
   const [isLeaving, setIsLeaving] = useState(false);
+  const [isDuplicateSession, setIsDuplicateSession] = useState(false);
+
+  // Pre-join device check states
+  const [hasJoined, setHasJoined] = useState(false);
+  const [videoDeviceId, setVideoDeviceId] = useState('');
+  const [audioDeviceId, setAudioDeviceId] = useState('');
+  const [speakerDeviceId, setSpeakerDeviceId] = useState('');
+
+  // Screen share state variables
+  const [remoteScreenShares, setRemoteScreenShares] = useState<{ [peerId: string]: { stream: MediaStream, producerId: string, consumerId: string } }>({});
+  const [isLocalScreenSharing, setIsLocalScreenSharing] = useState(false);
+  const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
+  const screenProducerRef = useRef<any>(null);
+  const localScreenStreamRef = useRef<MediaStream | null>(null);
 
   const [isMuted, setIsMuted] = useState(true);
   const [isVideoOff, setIsVideoOff] = useState(true);
   const [activeSpeakers, setActiveSpeakers] = useState<Set<string>>(new Set());
-  const [orderedParticipants, setOrderedParticipants] = useState<string[]>([]);
   const isSpeaking = useSpeakingDetection(stream, isMuted);
 
-  const videoNodeRef = useRef<HTMLVideoElement | null>(null);
-  const videoRef = useCallback((node: HTMLVideoElement | null) => {
-    videoNodeRef.current = node;
-    if (node && stream) {
-      node.srcObject = stream;
+  // Dynamically update document title based on room name and join state
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const displayId = roomId.charAt(0).toUpperCase() + roomId.slice(1);
+      if (!hasJoined) {
+        document.title = `Setup: ${displayId} | Dot Live`;
+      } else {
+        document.title = `Classroom: ${displayId} | Dot Live`;
+      }
     }
-  }, [stream]);
+  }, [roomId, hasJoined]);
+
+  const triggerToast = useCallback((message: string, type: 'join' | 'leave') => {
+    const id = Math.random().toString(36).substring(2, 9);
+    setToasts(prev => {
+      const next = [...prev, { id, message, type }];
+      return next.slice(-4);
+    });
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 4500);
+  }, []);
+
+
 
   const socketRef = useRef<Socket | null>(null);
+  const isDuplicateSessionRef = useRef(false);
 
   // Mediasoup refs
   const deviceRef = useRef<Device | null>(null);
   const sendTransportRef = useRef<any>(null);
   const recvTransportRef = useRef<any>(null);
-  const pendingProducers = useRef<{ producerId: string, peerId: string }[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
+  const userIdRef = useRef<string>('');
+  const pendingProducers = useRef<{ producerId: string, peerId: string, appData?: any }[]>([]);
 
   useEffect(() => {
     setIsMounted(true);
+    if (typeof window !== 'undefined') {
+      let id = localStorage.getItem('dotlive_user_id');
+      if (!id) {
+        id = 'usr_' + Math.random().toString(36).substring(2, 11);
+        localStorage.setItem('dotlive_user_id', id);
+      }
+      userIdRef.current = id;
+    }
   }, []);
 
   useEffect(() => {
+    if (!hasJoined) return;
+
     const hostname = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
-    const defaultBackendUrl = `http://${hostname}:3001`;
+    const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'https:' : 'http:';
+    const defaultBackendUrl = `${protocol}//${hostname}:3001`;
     const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || defaultBackendUrl;
     const socket = io(
       backendUrl,
@@ -70,43 +118,47 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
     );
     socketRef.current = socket;
 
-    socket.on('connect', () => {
-      setLocalSocketId(socket.id || null);
-    });
-
-    const triggerToast = (message: string, type: 'join' | 'leave') => {
-      const id = Math.random().toString(36).substring(2, 9);
-      setToasts(prev => {
-        const next = [...prev, { id, message, type }];
-        return next.slice(-4);
-      });
-      setTimeout(() => {
-        setToasts(prev => prev.filter(t => t.id !== id));
-      }, 4500);
-    };
+    // Connect listener registered below startSFU to allow lexical reference on reconnect
 
     const startSFU = async () => {
-      let localStream: MediaStream | null = null;
+      let localStream: MediaStream | null = streamRef.current;
+      
+      const isStreamActive = localStream && 
+                             localStream.active && 
+                             localStream.getTracks().length > 0 && 
+                             localStream.getTracks().every(track => track.readyState === 'live');
+                             
+      if (!isStreamActive) {
+        localStream = null;
+      }
+
       try {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          throw new Error("Secure context required for camera/microphone access. IP based access requires HTTPS or browser flag configuration.");
+        if (!localStream) {
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            throw new Error("Secure context required for camera/microphone access. IP based access requires HTTPS or browser flag configuration.");
+          }
+
+          // 1. Get Local Media using selected devices
+          const mediaConstraints = {
+            video: {
+              deviceId: videoDeviceId ? { exact: videoDeviceId } : undefined,
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 30 }
+            },
+            audio: audioDeviceId ? { deviceId: { exact: audioDeviceId } } : true
+          };
+          localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
+
+          // Disable tracks initially based on pre-join user selections
+          const audioTrack = localStream.getAudioTracks()[0];
+          if (audioTrack) audioTrack.enabled = !isMuted;
+          const videoTrack = localStream.getVideoTracks()[0];
+          if (videoTrack) videoTrack.enabled = !isVideoOff;
+
+          setStream(localStream);
+          streamRef.current = localStream;
         }
-
-        // 1. Get Local Media
-        const mediaConstraints = {
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-          audio: true
-        };
-        localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
-
-        // Disable tracks initially so user joins with camera off and muted by default
-        const audioTrack = localStream.getAudioTracks()[0];
-        if (audioTrack) audioTrack.enabled = false;
-        const videoTrack = localStream.getVideoTracks()[0];
-        if (videoTrack) videoTrack.enabled = false;
-
-        setStream(localStream);
-        if (videoNodeRef.current) videoNodeRef.current.srcObject = localStream;
       } catch (err: any) {
         console.warn("Could not get local media stream:", err);
         setMediaError(err.message || "Failed to access camera or microphone.");
@@ -115,11 +167,19 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
       }
 
       // 2. Join Room & Setup Device
-      socket.emit('joinRoom', { roomId, mediaState: { video: localStream ? !isVideoOff : false, audio: localStream ? !isMuted : false } }, async ({ rtpCapabilities, participants: existingParticipants, peerMediaStates: existingMediaStates }: any) => {
+      socket.emit('joinRoom', { 
+        roomId, 
+        role: initialRole, 
+        userId: userIdRef.current,
+        mediaState: { video: localStream ? !isVideoOff : false, audio: localStream ? !isMuted : false } 
+      }, async ({ rtpCapabilities, participants: existingParticipants, peerMediaStates: existingMediaStates, peerRoles: existingRoles }: any) => {
         setLocalSocketId(socket.id || null);
         setParticipants(new Set(existingParticipants));
         if (existingMediaStates) {
           setPeerMediaStates(existingMediaStates);
+        }
+        if (existingRoles) {
+          setPeerRoles(existingRoles);
         }
         const device = new Device();
         deviceRef.current = device;
@@ -144,9 +204,14 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
               socket.emit('transport-produce', {
                 transportId: sendTransport.id,
                 kind: parameters.kind,
-                rtpParameters: parameters.rtpParameters
-              }, ({ id }: any) => {
-                callback({ id });
+                rtpParameters: parameters.rtpParameters,
+                appData: parameters.appData
+              }, (response: any) => {
+                if (response.error) {
+                  errback(new Error(response.error));
+                } else {
+                  callback({ id: response.id });
+                }
               });
             });
 
@@ -188,12 +253,12 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
 
           // Consume existing producers
           socket.emit('getProducers', {}, (producers: any[]) => {
-            producers.forEach(p => consumeRemote(p.producerId, p.peerId, recvTransport, device));
+            producers.forEach(p => consumeRemote(p.producerId, p.peerId, recvTransport, device, p.appData));
 
             const existingIds = new Set(producers.map(p => p.producerId));
             pendingProducers.current.forEach(p => {
               if (!existingIds.has(p.producerId)) {
-                consumeRemote(p.producerId, p.peerId, recvTransport, device);
+                consumeRemote(p.producerId, p.peerId, recvTransport, device, p.appData);
               }
             });
             pendingProducers.current = [];
@@ -205,7 +270,42 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
 
     startSFU();
 
-    const consumeRemote = (producerId: string, peerId: string, transport: any, device: Device) => {
+    socket.on('connect', () => {
+      if (isDuplicateSessionRef.current) {
+        console.log("Socket connected but duplicate session is active. Disconnecting and ignoring.");
+        socket.disconnect();
+        return;
+      }
+      const oldSocketId = localSocketIdRef.current;
+      setLocalSocketId(socket.id || null);
+      localSocketIdRef.current = socket.id || null;
+      
+      // Reconnection detection: if device already exists and we had a previous socket ID, we are reconnecting!
+      if (deviceRef.current && oldSocketId && oldSocketId !== socket.id) {
+        console.log("Socket reconnected! Re-joining room with new Socket ID...");
+        
+        // Clean up previous peer states to avoid duplicates
+        setPeers({});
+        setParticipants(new Set());
+        setPeerMediaStates({});
+        setPeerRoles({});
+        
+        // Close old transports if they exist
+        try {
+          if (sendTransportRef.current) sendTransportRef.current.close();
+          if (recvTransportRef.current) recvTransportRef.current.close();
+        } catch (e) {
+          console.warn("Error closing old transports on reconnect:", e);
+        }
+        
+        // Restart room join and WebRTC setup
+        startSFU();
+      } else {
+        localSocketIdRef.current = socket.id || null;
+      }
+    });
+
+    const consumeRemote = (producerId: string, peerId: string, transport: any, device: Device, appData?: any) => {
       socket.emit('consume', {
         rtpCapabilities: device.rtpCapabilities,
         transportId: transport.id,
@@ -217,12 +317,24 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
           const consumer = await transport.consume({ id, producerId, kind, rtpParameters });
           const track = consumer.track;
 
-          setPeers(prev => {
-            const existingStream = prev[peerId] || new MediaStream();
-            const newStream = new MediaStream(existingStream.getTracks());
-            newStream.addTrack(track);
-            return { ...prev, [peerId]: newStream };
-          });
+          if (appData && appData.mediaType === 'screen') {
+            setRemoteScreenShares(prev => ({
+              ...prev,
+              [peerId]: {
+                stream: new MediaStream([track]),
+                producerId,
+                consumerId: consumer.id
+              }
+            }));
+            triggerToast(`User-${peerId.substring(0, 4)} is sharing screen`, 'join');
+          } else {
+            setPeers(prev => {
+              const existingStream = prev[peerId] || new MediaStream();
+              const newStream = new MediaStream(existingStream.getTracks());
+              newStream.addTrack(track);
+              return { ...prev, [peerId]: newStream };
+            });
+          }
 
           // Ensure peer is in participants list so they are rendered
           setParticipants(prev => {
@@ -239,17 +351,18 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
       });
     };
 
-    socket.on('new-producer', ({ producerId, peerId }) => {
+    socket.on('new-producer', ({ producerId, peerId, appData }) => {
       if (recvTransportRef.current && deviceRef.current) {
-        consumeRemote(producerId, peerId, recvTransportRef.current, deviceRef.current);
+        consumeRemote(producerId, peerId, recvTransportRef.current, deviceRef.current, appData);
       } else {
-        pendingProducers.current.push({ producerId, peerId });
+        pendingProducers.current.push({ producerId, peerId, appData });
       }
     });
 
-    socket.on('user-joined', (data: string | { userId: string, mediaState?: { video: boolean, audio: boolean } }) => {
+    socket.on('user-joined', (data: string | { userId: string, mediaState?: { video: boolean, audio: boolean }, role?: string }) => {
       const userId = typeof data === 'string' ? data : data.userId;
       const mediaState = typeof data === 'string' ? undefined : data.mediaState;
+      const peerRole = typeof data === 'string' ? 'student' : (data.role || 'student');
 
       setParticipants(prev => {
         const next = new Set(prev);
@@ -264,10 +377,17 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
         }));
       }
 
-      triggerToast(`Student ${userId.substring(0, 4)} entered the classroom`, 'join');
+      setPeerRoles(prev => ({
+        ...prev,
+        [userId]: peerRole
+      }));
+
+      const roleDisplay = peerRole === 'trainer' ? 'Trainer' : 'Student';
+      triggerToast(`${roleDisplay} ${userId.substring(0, 4)} entered the classroom`, 'join');
     });
 
     socket.on('user-disconnected', (userId) => {
+      const peerRole = peerRoles[userId] || 'student';
       setParticipants(prev => {
         const next = new Set(prev);
         next.delete(userId);
@@ -283,12 +403,29 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
         delete newStates[userId];
         return newStates;
       });
+      setPeerRoles((prev) => {
+        const newRoles = { ...prev };
+        delete newRoles[userId];
+        return newRoles;
+      });
 
-      triggerToast(`Student ${userId.substring(0, 4)} left the classroom`, 'leave');
+      const roleDisplay = peerRole === 'trainer' ? 'Trainer' : 'Student';
+      triggerToast(`${roleDisplay} ${userId.substring(0, 4)} left the classroom`, 'leave');
     });
 
     socket.on('producer-closed', ({ producerId }) => {
-      // Complex to handle without storing consumers, but standard WebRTC automatically fires track.onended
+      setRemoteScreenShares(prev => {
+        const next = { ...prev };
+        for (const peerId in next) {
+          if (next[peerId].producerId === producerId) {
+            next[peerId].stream.getTracks().forEach(t => t.stop());
+            delete next[peerId];
+            triggerToast(`User-${peerId.substring(0, 4)} stopped screen sharing`, 'leave');
+            break;
+          }
+        }
+        return next;
+      });
     });
 
     socket.on('toggle-media', (payload: { userId: string, type: 'video' | 'audio', isOff: boolean }) => {
@@ -299,6 +436,17 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
           [payload.type]: !payload.isOff
         }
       }));
+    });
+
+    socket.on('duplicate-session', () => {
+      isDuplicateSessionRef.current = true;
+      setIsDuplicateSession(true);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+      }
+      setTimeout(() => {
+        router.push('/');
+      }, 4000);
     });
 
     return () => {
@@ -315,6 +463,10 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
 
       if (typeof window !== 'undefined') {
         window.addEventListener('unhandledrejection', handleUnhandledRejection);
+      }
+
+      if (localScreenStreamRef.current) {
+        localScreenStreamRef.current.getTracks().forEach(t => t.stop());
       }
 
       socket.disconnect();
@@ -343,7 +495,25 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
         }
       }, 1000);
     };
-  }, [roomId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, hasJoined, videoDeviceId, audioDeviceId]);
+
+  interface JoinRoomConfig {
+    videoDeviceId: string;
+    audioDeviceId: string;
+    speakerDeviceId: string;
+    isVideoOff: boolean;
+    isMuted: boolean;
+  }
+
+  const handleJoinRoom = ({ videoDeviceId, audioDeviceId, speakerDeviceId, isVideoOff, isMuted }: JoinRoomConfig) => {
+    setVideoDeviceId(videoDeviceId);
+    setAudioDeviceId(audioDeviceId);
+    setSpeakerDeviceId(speakerDeviceId);
+    setIsVideoOff(isVideoOff);
+    setIsMuted(isMuted);
+    setHasJoined(true);
+  };
 
   const toggleMute = () => {
     if (stream) {
@@ -380,6 +550,102 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
     }, 1200);
   };
 
+  const startScreenShare = async () => {
+    if (!sendTransportRef.current) {
+      triggerToast("WebRTC send transport not ready", "leave");
+      return;
+    }
+    
+    let screenStream: MediaStream;
+    try {
+      screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 30 }
+        },
+        audio: false
+      });
+    } catch (err: unknown) {
+      console.warn("Screen capture cancelled or failed:", err);
+      return;
+    }
+
+    const track = screenStream.getVideoTracks()[0];
+    if (!track) return;
+
+    try {
+      const screenProducer = await sendTransportRef.current.produce({
+        track,
+        appData: { mediaType: 'screen' }
+      });
+      
+      screenProducerRef.current = screenProducer;
+      localScreenStreamRef.current = screenStream;
+      setLocalScreenStream(screenStream);
+      setIsLocalScreenSharing(true);
+      triggerToast("You started sharing your screen", "join");
+
+      track.onended = () => {
+        stopScreenShare();
+      };
+    } catch (err: unknown) {
+      console.error("Screen share produce failed:", err);
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      triggerToast(errorMsg, "leave");
+      screenStream.getTracks().forEach(t => t.stop());
+    }
+  };
+
+  const stopScreenShare = async () => {
+    if (!localScreenStreamRef.current && !screenProducerRef.current) {
+      return;
+    }
+
+    if (screenProducerRef.current) {
+      const producerId = screenProducerRef.current.id;
+      try {
+        screenProducerRef.current.close();
+      } catch (e) {
+        console.warn(e);
+      }
+      screenProducerRef.current = null;
+      socketRef.current?.emit('closeProducer', { producerId });
+    }
+    if (localScreenStreamRef.current) {
+      localScreenStreamRef.current.getTracks().forEach(t => t.stop());
+      localScreenStreamRef.current = null;
+    }
+    setLocalScreenStream(null);
+    setIsLocalScreenSharing(false);
+    triggerToast("You stopped sharing your screen", "leave");
+  };
+
+  const toggleScreenShare = async () => {
+    if (isLocalScreenSharing) {
+      await stopScreenShare();
+    } else {
+      await startScreenShare();
+    }
+  };
+
+  const activeRemotePresenterId = useMemo(() => {
+    const ids = Object.keys(remoteScreenShares);
+    return ids.length > 0 ? ids[0] : null;
+  }, [remoteScreenShares]);
+
+  const activePresenterName = isLocalScreenSharing
+    ? "You"
+    : activeRemotePresenterId
+    ? `User-${activeRemotePresenterId.substring(0, 4)}`
+    : "";
+
+  const activeScreenShareStream = isLocalScreenSharing
+    ? localScreenStream
+    : activeRemotePresenterId
+    ? remoteScreenShares[activeRemotePresenterId].stream
+    : null;
+
   const handleSpeakingChange = useCallback((id: string, speaking: boolean) => {
     setActiveSpeakers(prev => {
       if (prev.has(id) === speaking) return prev;
@@ -392,89 +658,18 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
 
   const totalParticipants = Math.max(participants.size, Object.keys(peers).length + 1);
 
-  // Synchronize orderedParticipants when participants join or leave
-  useEffect(() => {
-    const selfId = localSocketId || socketRef.current?.id;
-    const remotePeers = Array.from(participants).filter(p => p !== selfId);
 
-    setOrderedParticipants(prev => {
-      // 1. Filter out any participants who left
-      const filtered = prev.filter(p => remotePeers.includes(p));
 
-      // 2. Add any new participants who joined
-      const newPeers = remotePeers.filter(p => !filtered.includes(p));
+  const selfId = localSocketId || '';
 
-      return [...filtered, ...newPeers];
-    });
-  }, [participants, localSocketId]);
-
-  // Move speaking participants to the front of orderedParticipants in real-time
-  // but let them stay at the front when they stop speaking!
-  useEffect(() => {
-    if (activeSpeakers.size === 0) return;
-
-    setOrderedParticipants(prev => {
-      const currentSpeakers = Array.from(activeSpeakers);
-
-      // Filter out speakers from their current positions
-      const nonSpeakers = prev.filter(p => !currentSpeakers.includes(p));
-
-      // Filter the speakers who actually exist in our current remote list
-      const validSpeakers = currentSpeakers.filter(p => prev.includes(p));
-
-      // Put valid speakers at the very front
-      return [...validSpeakers, ...nonSpeakers];
-    });
-  }, [activeSpeakers]);
-
-  const sortedRemoteParticipants = orderedParticipants;
-
-  // --- Sidebar Layout Calculations ---
-  // Spotlight is the first remote participant if available, otherwise yourself (local)
-  const spotlightPeerId = useMemo(() => {
-    if (sortedRemoteParticipants.length > 0) {
-      return sortedRemoteParticipants[0];
-    }
-    return null;
-  }, [sortedRemoteParticipants]);
-
-  // Sidebar side list items: Local Video, next remote participant if any, and "+X More" if length > 2
-  const sidebarSidePeers = useMemo(() => {
-    if (sortedRemoteParticipants.length > 1) {
-      return [sortedRemoteParticipants[1]];
-    }
-    return [];
-  }, [sortedRemoteParticipants]);
-
-  const hasSidebarOthers = sortedRemoteParticipants.length > 2;
-  const sidebarOthersCount = sortedRemoteParticipants.length - 2;
-
-  // --- Paginated Layout Calculations ---
-  const paginatedTilesList = useMemo(() => {
-    return [
-      { type: 'local', id: 'local' },
-      ...sortedRemoteParticipants.map(peerId => ({ type: 'remote', id: peerId }))
-    ];
-  }, [sortedRemoteParticipants]);
-
-  const totalPages = Math.ceil(paginatedTilesList.length / 12);
-  const safeCurrentPage = Math.min(currentPage, Math.max(0, totalPages - 1));
-
-  const pageTiles = useMemo(() => {
-    return paginatedTilesList.slice(safeCurrentPage * 12, (safeCurrentPage + 1) * 12);
-  }, [paginatedTilesList, safeCurrentPage]);
-
-  const renderedTilesCount = pageTiles.length;
-
-  let gridClass = "grid-cols-1 md:grid-cols-1 max-w-6xl mx-auto auto-rows-fr";
-  if (renderedTilesCount === 2) {
-    gridClass = "grid-cols-1 md:grid-cols-2 auto-rows-fr";
-  } else if (renderedTilesCount >= 3 && renderedTilesCount <= 4) {
-    gridClass = "grid-cols-2 md:grid-cols-2 auto-rows-fr";
-  } else if (renderedTilesCount >= 5 && renderedTilesCount <= 9) {
-    gridClass = "grid-cols-2 md:grid-cols-3 auto-rows-fr";
-  } else if (renderedTilesCount >= 10 && renderedTilesCount <= 12) {
-    gridClass = "grid-cols-2 md:grid-cols-4 auto-rows-fr";
+  if (!hasJoined) {
+    return (
+      <DeviceSetup
+        roomName={roomId}
+        role={initialRole}
+        onJoin={handleJoinRoom}
+      />
+    );
   }
 
   return (
@@ -552,6 +747,49 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
           </div>
         </div>
       )}
+
+      {/* 3. Duplicate Session / Connection Terminated Overlay */}
+      {isDuplicateSession && (
+        <div className="fixed inset-0 bg-[#080d0b] z-[10000] flex flex-col items-center justify-center overflow-hidden">
+          {/* Cyberpunk ambient warnings */}
+          <div className="absolute w-[400px] h-[400px] rounded-full border border-amber-500/5 animate-[ping_4s_infinite]" />
+          <div className="absolute w-[600px] h-[600px] rounded-full border border-amber-500/5 animate-[ping_6s_infinite]" />
+
+          {/* Central warning sphere with spinning cyber rings */}
+          <div className="relative flex items-center justify-center w-36 h-36">
+            {/* Spinning Outer Amber Ring */}
+            <div className="absolute inset-0 rounded-full border border-dashed border-amber-500/20 animate-spin" style={{ animationDuration: '10s' }} />
+            
+            {/* Spinning Inner Counter-Ring */}
+            <div className="absolute inset-2 rounded-full border-2 border-dashed border-amber-500/10 animate-spin" style={{ animationDuration: '5s', animationDirection: 'reverse' }} />
+
+            {/* Glowing neon amber center core */}
+            <div className="w-24 h-24 rounded-full bg-[#14100a]/90 border border-amber-500/40 shadow-[0_0_50px_rgba(245,158,11,0.25)] flex flex-col items-center justify-center relative">
+              {/* Laser vertical sweep inside the core */}
+              <div className="absolute w-full h-0.5 bg-amber-500/30 animate-[bounce_2s_infinite]" />
+
+              <AlertTriangle className="w-8 h-8 text-amber-500 animate-pulse" />
+            </div>
+          </div>
+
+          <div className="mt-8 text-center max-w-sm px-6 z-10">
+            <h2 className="text-sm font-bold tracking-widest text-amber-400 uppercase animate-pulse">
+              Session Terminated
+            </h2>
+            <p className="text-[11px] text-amber-200/80 font-semibold tracking-wide mt-3 leading-relaxed">
+              This classroom has been opened in another browser tab or window.
+            </p>
+            <p className="text-[10px] text-amber-600/70 font-mono tracking-wider uppercase mt-2">
+              Redirecting to home page...
+            </p>
+            <div className="mt-5 flex items-center justify-center space-x-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500/50 animate-bounce" style={{ animationDelay: '0ms' }} />
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500/50 animate-bounce" style={{ animationDelay: '150ms' }} />
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500/50 animate-bounce" style={{ animationDelay: '300ms' }} />
+            </div>
+          </div>
+        </div>
+      )}
       <ClassroomHeader
         roomId={roomId}
         totalParticipants={totalParticipants}
@@ -562,163 +800,125 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
       />
 
       <main className="flex-1 p-4 md:p-6 overflow-hidden relative flex flex-col md:flex-row gap-4 h-full w-full min-h-0">
-        <div className="flex-1 min-h-0 flex flex-col relative h-full w-full">
-          {mediaError && (
-            <div className="mb-4 bg-amber-500/10 border border-amber-500/30 text-amber-200 px-4 py-3 rounded-2xl flex items-start space-x-3 text-xs md:text-sm shadow-lg max-w-2xl mx-auto z-50 relative shrink-0">
-              <div className="font-bold text-amber-400 bg-amber-500/20 px-2 py-0.5 rounded-md uppercase text-[10px] tracking-wider mt-0.5 shrink-0">Security Alert</div>
-              <div className="flex-1 text-left">
-                <p className="font-semibold mb-1 text-amber-300">Camera & Microphone Blocked (Insecure Context)</p>
-                <p className="text-[11px] md:text-xs text-amber-300/80 leading-relaxed">
-                  Browsers disable media capture on IP addresses by default. You can still watch the class! To turn on your camera/mic:
-                  <span className="block mt-1 font-medium text-amber-200">
-                    1. Visit <code className="bg-amber-950/60 px-1 py-0.5 rounded text-amber-400 font-mono text-[11px] select-all">chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>
-                    <br />
-                    2. Add <code className="bg-amber-950/60 px-1 py-0.5 rounded text-amber-400 font-mono text-[11px] select-all">http://{isMounted ? window.location.hostname : 'localhost'}:3000</code> to the list and set it to <strong className="text-amber-300">Enabled</strong>.
-                    <br />
-                    3. Relaunch your browser.
-                  </span>
-                </p>
-              </div>
-            </div>
-          )}
-          {layoutStyle === 'paginated' ? (
-            <div className="flex-1 w-full h-full max-h-full min-h-0 flex items-center justify-between relative group/arrows">
-              {/* Left Page Arrow */}
-              {totalPages > 1 && (
-                <button
-                  disabled={safeCurrentPage === 0}
-                  onClick={() => setCurrentPage(prev => Math.max(0, prev - 1))}
-                  className={`absolute left-0 z-40 bg-black/60 hover:bg-green-500 hover:text-[#070a09] text-green-500 border border-green-950/40 p-3 rounded-full transition-all duration-300 backdrop-blur-md shadow-2xl flex items-center justify-center ${safeCurrentPage === 0 ? 'opacity-0 pointer-events-none' : 'opacity-100 group-hover/arrows:scale-105'
-                    }`}
-                >
-                  <ChevronLeft size={24} />
-                </button>
-              )}
+        <div className="flex-1 min-h-0 flex flex-col relative h-full w-full gap-4">
+          {mediaError && (() => {
+            const errStr = mediaError.toLowerCase();
+            const isPermissionDenied = errStr.includes("permission") || errStr.includes("allowed") || errStr.includes("denied");
+            const isDeviceNotFound = errStr.includes("notfound") || errStr.includes("not found") || errStr.includes("devices") || errStr.includes("found");
 
-              {/* Grid Container */}
-              <div className={`grid gap-4 w-full h-full max-h-full flex-1 min-h-0 items-center justify-center justify-items-center content-center ${gridClass} transition-all duration-500 ease-in-out px-10`}>
-                {pageTiles.map(tile => {
-                  if (tile.type === 'local') {
-                    return (
-                      <LocalVideoComponent
-                        key="local"
-                        videoRef={videoRef}
-                        isVideoOff={isVideoOff}
-                        isMuted={isMuted}
-                        isSpeaking={isSpeaking}
-                      />
-                    );
-                  } else {
-                    const peerId = tile.id;
-                    return (
-                      <VideoComponent
-                        key={peerId}
-                        stream={peers[peerId]}
-                        peerId={peerId}
-                        hasVideo={peerMediaStates[peerId]?.video ?? true}
-                        hasAudio={peerMediaStates[peerId]?.audio ?? true}
-                        isSpeaking={activeSpeakers.has(peerId)}
-                      />
-                    );
-                  }
-                })}
-              </div>
+            if (isPermissionDenied) {
+              return (
+                <div className="mb-4 bg-amber-500/10 border border-amber-500/30 text-amber-200 px-4 py-3 rounded-2xl flex items-start space-x-3 text-xs md:text-sm shadow-lg max-w-2xl mx-auto z-50 relative shrink-0">
+                  <div className="font-bold text-amber-400 bg-amber-500/20 px-2 py-0.5 rounded-md uppercase text-[10px] tracking-wider mt-0.5 shrink-0">Permission Blocked</div>
+                  <div className="flex-1 text-left">
+                    <p className="font-semibold mb-1 text-amber-300">Camera & Microphone Access Denied</p>
+                    <p className="text-[11px] md:text-xs text-amber-300/80 leading-relaxed">
+                      You blocked access to your camera or microphone. You can still watch and participate! If you want to turn on your media:
+                      <span className="block mt-1.5 font-medium text-amber-200">
+                        1. Click the site settings icon (lock/sliders icon next to URL) in your browser address bar.
+                        <br />
+                        2. Reset/Allow Camera and Microphone permissions.
+                        <br />
+                        3. Refresh the page to apply.
+                      </span>
+                    </p>
+                  </div>
+                </div>
+              );
+            }
 
-              {/* Right Page Arrow */}
-              {totalPages > 1 && (
-                <button
-                  disabled={safeCurrentPage === totalPages - 1}
-                  onClick={() => setCurrentPage(prev => Math.min(totalPages - 1, prev + 1))}
-                  className={`absolute right-0 z-40 bg-black/60 hover:bg-green-500 hover:text-[#070a09] text-green-500 border border-green-950/40 p-3 rounded-full transition-all duration-300 backdrop-blur-md shadow-2xl flex items-center justify-center ${safeCurrentPage === totalPages - 1 ? 'opacity-0 pointer-events-none' : 'opacity-100 group-hover/arrows:scale-105'
-                    }`}
-                >
-                  <ChevronRight size={24} />
-                </button>
-              )}
+            if (isDeviceNotFound) {
+              return (
+                <div className="mb-4 bg-amber-500/10 border border-amber-500/30 text-amber-200 px-4 py-3 rounded-2xl flex items-start space-x-3 text-xs md:text-sm shadow-lg max-w-2xl mx-auto z-50 relative shrink-0">
+                  <div className="font-bold text-amber-400 bg-amber-500/20 px-2 py-0.5 rounded-md uppercase text-[10px] tracking-wider mt-0.5 shrink-0">No Devices</div>
+                  <div className="flex-1 text-left">
+                    <p className="font-semibold mb-1 text-amber-300">No Media Devices Found</p>
+                    <p className="text-[11px] md:text-xs text-amber-300/80 leading-relaxed font-mono">
+                      {mediaError}
+                    </p>
+                    <p className="text-[11px] md:text-xs text-amber-300/60 leading-relaxed mt-1">
+                      Please plug in a camera or microphone and refresh this page.
+                    </p>
+                  </div>
+                </div>
+              );
+            }
+
+            // Insecure Context or fallback error
+            return (
+              <div className="mb-4 bg-amber-500/10 border border-amber-500/30 text-amber-200 px-4 py-3 rounded-2xl flex items-start space-x-3 text-xs md:text-sm shadow-lg max-w-2xl mx-auto z-50 relative shrink-0">
+                <div className="font-bold text-amber-400 bg-amber-500/20 px-2 py-0.5 rounded-md uppercase text-[10px] tracking-wider mt-0.5 shrink-0">Security Alert</div>
+                <div className="flex-1 text-left">
+                  <p className="font-semibold mb-1 text-amber-300">Camera & Microphone Blocked (Insecure Context)</p>
+                  <p className="text-[11px] md:text-xs text-amber-300/80 leading-relaxed">
+                    Browsers disable media capture on IP addresses by default. You can still watch the class! To turn on your camera/mic:
+                    <span className="block mt-1 font-medium text-amber-200">
+                      1. Visit <code className="bg-amber-950/60 px-1 py-0.5 rounded text-amber-400 font-mono text-[11px] select-all">chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>
+                      <br />
+                      2. Add <code className="bg-amber-950/60 px-1 py-0.5 rounded text-amber-400 font-mono text-[11px] select-all">http://{isMounted ? window.location.hostname : 'localhost'}:3000</code> to the list and set it to <strong className="text-amber-300">Enabled</strong>.
+                      <br />
+                      3. Relaunch your browser.
+                    </span>
+                  </p>
+                </div>
+              </div>
+            );
+          })()}
+
+          {activeScreenShareStream ? (
+            <div className="flex-1 flex flex-col gap-4 min-h-0 h-full w-full min-w-0">
+              {/* Screen Share Spotlight */}
+              <ScreenSharePresenter
+                stream={activeScreenShareStream}
+                presenterName={activePresenterName}
+                isLocal={isLocalScreenSharing}
+                onStopShare={stopScreenShare}
+              />
+              
+              {/* Participant Webcam Filmstrip */}
+              <VideoGrid
+                layoutStyle="presentation"
+                localStream={stream}
+                localMediaState={{
+                  video: !isVideoOff,
+                  audio: !isMuted,
+                  isSpeaking
+                }}
+                peers={peers}
+                peerMediaStates={peerMediaStates}
+                activeSpeakers={activeSpeakers}
+                participants={participants}
+                localSocketId={localSocketId}
+              />
             </div>
           ) : (
-            // Sidebar Stage Layout
-            <div className="flex-1 w-full h-full max-h-full min-h-0 flex flex-col md:flex-row gap-4">
-              {/* Spotlight Main Area (75% width on desktop) */}
-              <div className="flex-[3] h-full w-full min-h-0 rounded-3xl overflow-hidden relative shadow-inner">
-                {spotlightPeerId ? (
-                  <VideoComponent
-                    key={spotlightPeerId}
-                    stream={peers[spotlightPeerId]}
-                    peerId={spotlightPeerId}
-                    hasVideo={peerMediaStates[spotlightPeerId]?.video ?? true}
-                    hasAudio={peerMediaStates[spotlightPeerId]?.audio ?? true}
-                    isSpeaking={activeSpeakers.has(spotlightPeerId)}
-                  />
-                ) : (
-                  <LocalVideoComponent
-                    videoRef={videoRef}
-                    isVideoOff={isVideoOff}
-                    isMuted={isMuted}
-                    isSpeaking={isSpeaking}
-                  />
-                )}
-              </div>
-
-              {/* Vertical Sidebar Column (25% width on desktop) */}
-              {spotlightPeerId && (
-                <div className="flex-[1] flex flex-row md:flex-col gap-4 h-full w-full min-h-0 max-w-none md:max-w-xs justify-center items-center">
-                  {/* Always include your local video on the side */}
-                  <div className="flex-1 min-h-0 w-full flex items-center justify-center">
-                    <LocalVideoComponent
-                      videoRef={videoRef}
-                      isVideoOff={isVideoOff}
-                      isMuted={isMuted}
-                      isSpeaking={isSpeaking}
-                    />
-                  </div>
-
-                  {/* Second slot (next remote peer) if exists */}
-                  {sidebarSidePeers.map(peerId => (
-                    <div key={peerId} className="flex-1 min-h-0 w-full flex items-center justify-center">
-                      <VideoComponent
-                        stream={peers[peerId]}
-                        peerId={peerId}
-                        hasVideo={peerMediaStates[peerId]?.video ?? true}
-                        hasAudio={peerMediaStates[peerId]?.audio ?? true}
-                        isSpeaking={activeSpeakers.has(peerId)}
-                      />
-                    </div>
-                  ))}
-
-                  {/* Third slot: "+X More" card if there are more than 2 remote peers */}
-                  {hasSidebarOthers && (
-                    <div className="flex-1 min-h-0 w-full flex items-center justify-center">
-                      <div
-                        onClick={() => setIsSidebarOpen(true)}
-                        className="w-full max-w-full max-h-full relative group rounded-3xl overflow-hidden bg-[#0d1411]/80 backdrop-blur-md shadow-xl border-2 border-green-900/30 flex flex-col items-center justify-center transition-all duration-300 hover:border-green-500/50 hover:bg-[#0d1411] cursor-pointer aspect-video"
-                      >
-                        <div className="w-12 h-12 bg-green-500/10 rounded-full flex items-center justify-center mb-2 border border-green-500/20 shadow-inner group-hover:bg-green-500/20 transition">
-                          <Users size={20} className="text-green-500 group-hover:scale-110 transition duration-300" />
-                        </div>
-                        <div className="text-center">
-                          <span className="block text-lg font-bold text-green-400">+{sidebarOthersCount}</span>
-                          <span className="text-[9px] font-semibold text-green-600 uppercase tracking-wider block">More Participants</span>
-                          <span className="text-[8px] text-green-700/80 mt-0.5 block group-hover:text-green-500 transition animate-pulse">Click to View</span>
-                        </div>
-                        <div className="absolute inset-0 bg-gradient-to-t from-black/40 to-transparent pointer-events-none" />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+            <VideoGrid
+              layoutStyle={layoutStyle}
+              localStream={stream}
+              localMediaState={{
+                video: !isVideoOff,
+                audio: !isMuted,
+                isSpeaking
+              }}
+              peers={peers}
+              peerMediaStates={peerMediaStates}
+              activeSpeakers={activeSpeakers}
+              participants={participants}
+              localSocketId={localSocketId}
+              onOpenDirectory={() => setIsSidebarOpen(true)}
+            />
           )}
 
           {/* Hidden audio consumers for all participants to track speaking status */}
           <div className="hidden">
-            {Array.from(participants).filter(p => p !== (localSocketId || socketRef.current?.id)).map(peerId => (
+            {Array.from(participants).filter(p => p !== selfId).map(peerId => (
               <AudioParticipant
                 key={peerId}
                 peerId={peerId}
                 stream={peers[peerId]}
                 isMuted={!(peerMediaStates[peerId]?.audio ?? true)}
                 onSpeakingChange={handleSpeakingChange}
+                speakerDeviceId={speakerDeviceId}
               />
             ))}
           </div>
@@ -748,12 +948,16 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
                 {/* Local User */}
                 <div className="bg-[#0f1814] border border-green-950/40 rounded-2xl p-3 flex items-center justify-between hover:border-green-500/20 transition">
                   <div className="flex items-center space-x-3">
-                    <div className="w-8 h-8 rounded-full bg-green-500/10 flex items-center justify-center font-bold text-green-500 text-xs border border-green-500/20">
-                      Y
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs border ${
+                      initialRole === 'trainer'
+                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                        : 'bg-green-500/10 text-green-500 border-green-500/20'
+                    }`}>
+                      {initialRole === 'trainer' ? 'T' : 'S'}
                     </div>
                     <div>
-                      <div className="text-xs font-semibold text-green-200">You (Local)</div>
-                      <div className="text-[10px] text-green-500/70">Broadcaster</div>
+                      <div className="text-xs font-semibold text-green-200">You ({initialRole === 'trainer' ? 'Trainer' : 'Student'})</div>
+                      <div className="text-[10px] text-green-500/70">{initialRole === 'trainer' ? 'Instructor' : 'Attendee'}</div>
                     </div>
                   </div>
                   <div className="flex items-center space-x-2">
@@ -765,21 +969,30 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
 
                 {/* Remote Peers */}
                 {Array.from(participants)
-                  .filter(peerId => peerId !== (localSocketId || socketRef.current?.id))
+                  .filter(peerId => peerId !== selfId)
                   .map(peerId => {
                     const peerHasVideo = peerMediaStates[peerId]?.video ?? true;
                     const peerHasAudio = peerMediaStates[peerId]?.audio ?? true;
                     const peerIsSpeaking = activeSpeakers.has(peerId);
+                    const peerRole = peerRoles[peerId] || 'student';
 
                     return (
                       <div key={peerId} className="bg-[#0e1612]/60 border border-green-950/30 rounded-2xl p-3 flex items-center justify-between hover:border-green-500/10 transition">
                         <div className="flex items-center space-x-3">
-                          <div className="w-8 h-8 rounded-full bg-green-900/30 flex items-center justify-center font-bold text-green-600 text-xs border border-green-900/20">
-                            S
+                          <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs border ${
+                            peerRole === 'trainer'
+                              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                              : 'bg-green-900/30 text-green-600 border-green-900/20'
+                          }`}>
+                            {peerRole === 'trainer' ? 'T' : 'S'}
                           </div>
                           <div>
-                            <div className="text-xs font-medium text-green-300">Student-{peerId.slice(0, 4)}</div>
-                            <div className="text-[10px] text-green-700">Viewer</div>
+                            <div className="text-xs font-medium text-green-300">
+                              {peerRole === 'trainer' ? 'Trainer' : 'Student'}-{peerId.slice(0, 4)}
+                            </div>
+                            <div className="text-[10px] text-green-700">
+                              {peerRole === 'trainer' ? 'Instructor' : 'Attendee'}
+                            </div>
                           </div>
                         </div>
                         <div className="flex items-center space-x-2">
@@ -906,6 +1119,9 @@ export default function LiveClassRoom({ roomId }: { roomId: string }) {
           setIsSettingsOpen(prev => !prev);
           setIsSidebarOpen(false);
         }}
+        isSharingScreen={isLocalScreenSharing}
+        toggleScreenShare={toggleScreenShare}
+        isScreenShareDisabled={!!activeRemotePresenterId}
       />
 
       {/* Small Glassmorphic Closable Notifications in Bottom-Right */}

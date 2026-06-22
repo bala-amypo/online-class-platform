@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "update-ip": "node ../update-config-ip.js",
+    "predev-https": "npm run update-ip",
+    "predev": "npm run update-ip",
+    "dev-https": "next dev -H 0.0.0.0 -p 3000 --experimental-https",
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
